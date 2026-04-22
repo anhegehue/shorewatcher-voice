@@ -40,11 +40,11 @@ async function startCall() {
     try {
         statusEl.textContent = '连接中...';
         
-        // 连接WebSocket
+        // 阿里云实时语音API - 正确的WebSocket连接方式
+        // 需要通过URL参数传递认证信息
         const wsUrl = `wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen3.5-omni-flash`;
-        ws = new WebSocket(wsUrl, {
-            headers: { 'Authorization': `Bearer ${apiKey}` }
-        });
+        
+        ws = new WebSocket(wsUrl);
         
         ws.onopen = async () => {
             statusEl.textContent = '已连接，请说话';
@@ -54,17 +54,25 @@ async function startCall() {
             isCallActive = true;
             avatarEl.classList.add('speaking');
             
-            // 发送session配置
+            // 发送认证消息
             ws.send(JSON.stringify({
-                type: 'session.update',
-                session: {
-                    modalities: ['text', 'audio'],
-                    input_audio_format: 'pcm16',
-                    output_audio_format: 'pcm16',
-                    input_audio_transcription: { model: 'whisper-1' },
-                    turn_detection: { type: 'server_vad' }
-                }
+                type: 'auth',
+                api_key: apiKey
             }));
+            
+            // 发送session配置
+            setTimeout(() => {
+                ws.send(JSON.stringify({
+                    type: 'session.update',
+                    session: {
+                        modalities: ['text', 'audio'],
+                        input_audio_format: 'pcm16',
+                        output_audio_format: 'pcm16',
+                        input_audio_transcription: { model: 'whisper-1' },
+                        turn_detection: { type: 'server_vad' }
+                    }
+                }));
+            }, 100);
             
             // 开始录音
             await startRecording();
@@ -77,7 +85,7 @@ async function startCall() {
         
         ws.onerror = (err) => {
             console.error('WebSocket error:', err);
-            statusEl.textContent = '连接失败，请检查API Key';
+            statusEl.textContent = '连接失败，请检查网络或API Key';
             stopCall();
         };
         
@@ -130,7 +138,7 @@ async function startRecording() {
         if (ws && ws.readyState === WebSocket.OPEN && isCallActive) {
             const inputData = e.inputBuffer.getChannelData(0);
             const pcmData = float32ToPcm16(inputData);
-            const base64Audio = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
+            const base64Audio = arrayBufferToBase64(pcmData.buffer);
             
             ws.send(JSON.stringify({
                 type: 'input_audio_buffer.append',
@@ -155,15 +163,22 @@ function float32ToPcm16(float32Array) {
     return int16Array;
 }
 
+function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
+
 function handleMessage(data) {
     if (data.type === 'response.audio_transcript.delta') {
-        // AI回复文本
         addTranscript('ai', data.delta);
         avatarEl.classList.add('speaking');
     }
     
     if (data.type === 'response.audio.delta') {
-        // AI音频输出
         playAudio(data.delta);
     }
     
@@ -172,13 +187,17 @@ function handleMessage(data) {
     }
     
     if (data.type === 'conversation.item.input_audio_transcription.completed') {
-        // 用户说的文本
         addTranscript('user', data.transcript);
     }
     
     if (data.type === 'error') {
         console.error('API Error:', data);
         statusEl.textContent = '错误: ' + (data.error?.message || '未知错误');
+    }
+    
+    if (data.type === 'auth_failed' || data.type === 'authentication_error') {
+        statusEl.textContent = '认证失败，请检查API Key';
+        stopCall();
     }
 }
 
@@ -191,25 +210,31 @@ function addTranscript(role, text) {
 }
 
 async function playAudio(base64Audio) {
-    const binaryString = atob(base64Audio);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+    if (!audioContext) return;
+    
+    try {
+        const binaryString = atob(base64Audio);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+        
+        const int16Array = new Int16Array(bytes.buffer);
+        const float32Array = new Float32Array(int16Array.length);
+        for (let i = 0; i < int16Array.length; i++) {
+            float32Array[i] = int16Array[i] / (int16Array[i] < 0 ? 0x8000 : 0x7FFF);
+        }
+        
+        const audioBuffer = audioContext.createBuffer(1, float32Array.length, 24000);
+        audioBuffer.getChannelData(0).set(float32Array);
+        
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        source.start();
+    } catch (e) {
+        console.error('Audio playback error:', e);
     }
-    
-    const int16Array = new Int16Array(bytes.buffer);
-    const float32Array = new Float32Array(int16Array.length);
-    for (let i = 0; i < int16Array.length; i++) {
-        float32Array[i] = int16Array[i] / (int16Array[i] < 0 ? 0x8000 : 0x7FFF);
-    }
-    
-    const audioBuffer = audioContext.createBuffer(1, float32Array.length, 24000);
-    audioBuffer.getChannelData(0).set(float32Array);
-    
-    const source = audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(audioContext.destination);
-    source.start();
 }
 
 // 注册Service Worker（PWA）
